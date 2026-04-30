@@ -1,0 +1,919 @@
+﻿<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <title>RAKBANK Hold Resume Listener</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 0;
+            padding: 12px;
+            background: #f7f7f7;
+            color: #222;
+        }
+
+        .card {
+            background: #ffffff;
+            border-radius: 10px;
+            padding: 14px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.12);
+            max-width: 450px;
+            margin: 0 auto;
+        }
+
+        .title {
+            font-size: 16px;
+            font-weight: bold;
+            color: #c00000;
+            margin-bottom: 8px;
+        }
+
+        .pill {
+            display: inline-block;
+            padding: 4px 10px;
+            border-radius: 999px;
+            font-size: 11px;
+            font-weight: bold;
+            margin-bottom: 10px;
+        }
+
+        .pill-on {
+            background: #e7f7e7;
+            color: #146c2e;
+        }
+
+        .pill-off {
+            background: #fde7e7;
+            color: #9b0000;
+        }
+
+        button {
+            margin-top: 10px;
+            padding: 10px;
+            border: none;
+            border-radius: 6px;
+            color: #ffffff;
+            font-size: 14px;
+            font-weight: bold;
+            cursor: pointer;
+        }
+
+        .secondary {
+            background: #555555;
+        }
+
+        .debug {
+            background: #1f5fbf;
+        }
+
+        .debug-active {
+            background: #083b8a;
+        }
+
+        .download-icon {
+            background: #0a8f43;
+            width: 44px;
+            min-width: 44px;
+            padding: 10px 0;
+            font-size: 18px;
+            display: none;
+        }
+
+        .row {
+            display: flex;
+            gap: 8px;
+        }
+
+            .row button.main {
+                flex: 1;
+            }
+
+        .status {
+            margin-top: 12px;
+            padding: 10px;
+            border-radius: 6px;
+            font-size: 13px;
+            background: #eeeeee;
+            white-space: pre-wrap;
+            word-break: break-word;
+            max-height: 420px;
+            overflow-y: auto;
+        }
+
+        .success {
+            background: #e7f7e7;
+            color: #146c2e;
+        }
+
+        .error {
+            background: #fde7e7;
+            color: #9b0000;
+        }
+
+        .info {
+            background: #e8f1ff;
+            color: #0b4b88;
+        }
+
+        .warning {
+            background: #fff4d8;
+            color: #8a5200;
+        }
+
+        .small {
+            font-size: 11px;
+            color: #666;
+            margin-top: 8px;
+            line-height: 1.4;
+        }
+    </style>
+</head>
+
+<body>
+    <div class="card">
+        <div class="title">RAKBANK - Hold / Resume Listener</div>
+
+        <div id="listenerPill" class="pill pill-off">Listener: Starting...</div>
+
+        <div class="row">
+            <button class="secondary main" onclick="clearSession()">Clear Session</button>
+            <button id="debugBtn" class="debug main" onclick="toggleDebugLogs()">Start Debug</button>
+            <button id="downloadBtn" class="download-icon" onclick="downloadDebugLogs()" title="Download Logs">⬇</button>
+        </div>
+
+        <div id="status" class="status info">Initializing listener...</div>
+
+        <div class="small">
+            Keep this app open while handling chats. Use <b>Start Debug</b> only when troubleshooting is required.
+        </div>
+    </div>
+
+    <script>
+        /************************************************************
+         * CONFIG - READ FROM URL OR SESSION
+         ************************************************************/
+        const CONFIG_PARAMS = new URLSearchParams(window.location.search);
+
+        const URL_CLIENT_ID = CONFIG_PARAMS.get("clientId") || "";
+        const URL_REGION = CONFIG_PARAMS.get("region") || "";
+        const URL_GC_TARGET_ENV = CONFIG_PARAMS.get("gcTargetEnv") || "";
+
+        if (URL_CLIENT_ID) {
+            sessionStorage.setItem("rakbank_clientId", URL_CLIENT_ID);
+        }
+
+        if (URL_REGION) {
+            sessionStorage.setItem("rakbank_region", URL_REGION);
+        } else if (URL_GC_TARGET_ENV) {
+            sessionStorage.setItem("rakbank_region", URL_GC_TARGET_ENV);
+        }
+
+        const OAUTH_CLIENT_ID =
+            URL_CLIENT_ID ||
+            sessionStorage.getItem("rakbank_clientId") ||
+            "";
+
+        const GENESYS_REGION =
+            URL_REGION ||
+            URL_GC_TARGET_ENV ||
+            sessionStorage.getItem("rakbank_region") ||
+            "mypurecloud.ie";
+
+        //const REDIRECT_URI =
+            //window.location.origin + window.location.pathname;
+        const REDIRECT_URI = "https://AF255690.corp.al-futtaim.com/rakbank-send-message.html";
+
+        const LOGIN_BASE = `https://login.${GENESYS_REGION}`;
+        const API_BASE = `https://api.${GENESYS_REGION}`;
+
+        /************************************************************
+         * PARTICIPANT ATTRIBUTE NAMES
+         ************************************************************/
+        const ATTR_REQUEST = "AFT_SendMessage_Request";
+        const ATTR_TEXT = "AFT_SendMessage_Text";
+        const ATTR_CONVERSATION_ID = "AFT_SendMessage_ConversationId";
+        const ATTR_COMMUNICATION_ID = "AFT_SendMessage_CommunicationId";
+        const ATTR_STATUS = "AFT_SendMessage_Status";
+        const ATTR_RESULT = "AFT_SendMessage_Result";
+        const ATTR_ERROR = "AFT_SendMessage_Error";
+
+        /************************************************************
+         * STATE
+         ************************************************************/
+        let pollTimer = null;
+        let isListening = false;
+        let isProcessing = false;
+
+        let debugMode = false;
+        let debugCaptureEnabled = false;
+        let debugLogs = [];
+
+        let lastSummary = "Initializing listener...";
+        let lastPollSummary = "";
+
+        /************************************************************
+         * PAGE INIT
+         ************************************************************/
+        window.onload = async function () {
+            try {
+                setStatus("Initializing listener...", "info", true);
+
+                const urlParams = new URLSearchParams(window.location.search);
+                const code = urlParams.get("code");
+
+                if (!OAUTH_CLIENT_ID) {
+                    setStatus(
+                        "Configuration error: Missing clientId in Client Application URL.",
+                        "error",
+                        true
+                    );
+                    return;
+                }
+
+                if (!GENESYS_REGION) {
+                    setStatus(
+                        "Configuration error: Missing region in Client Application URL.",
+                        "error",
+                        true
+                    );
+                    return;
+                }
+
+                if (code) {
+                    addDebug("OAUTH_CALLBACK", "OAuth code received");
+                    setStatus("OAuth code received. Getting access token...", "info", true);
+
+                    await handleOAuthCallback(code);
+                    cleanUrl();
+
+                    setStatus("Login successful. Listener started.", "success", true);
+                    startListening();
+                    return;
+                }
+
+                const token = getAccessToken();
+
+                if (!token) {
+                    addDebug("TOKEN_MISSING", "No valid access token. Starting PKCE login.");
+                    setStatus("Redirecting to Genesys Cloud login...", "info", true);
+                    await startPKCELogin();
+                    return;
+                }
+
+                addDebug("TOKEN_OK", "Existing access token found");
+                setStatus("Listener started. Waiting for Hold / Resume request...", "success", true);
+                startListening();
+
+            } catch (err) {
+                addDebug("INIT_ERROR", getErrorText(err));
+                setStatus("Initialization error: " + getErrorText(err), "error", true);
+            }
+        };
+
+        /************************************************************
+         * AUTO LISTENER
+         ************************************************************/
+        function startListening() {
+            if (pollTimer) {
+                clearInterval(pollTimer);
+            }
+
+            isListening = true;
+            updateListenerPill();
+
+            addDebug("LISTENER_STARTED", "Polling active conversations every 1.5 seconds");
+
+            pollOnce();
+            pollTimer = setInterval(pollOnce, 1500);
+        }
+
+        function updateListenerPill() {
+            const pill = document.getElementById("listenerPill");
+
+            if (isListening) {
+                pill.className = "pill pill-on";
+                pill.textContent = "Listener: Running";
+            } else {
+                pill.className = "pill pill-off";
+                pill.textContent = "Listener: Stopped";
+            }
+        }
+
+        /************************************************************
+         * POLL ONCE
+         ************************************************************/
+        async function pollOnce() {
+            try {
+                if (!isListening || isProcessing) return;
+
+                const token = getAccessToken();
+
+                if (!token) {
+                    addDebug("TOKEN_EXPIRED", "Token missing/expired. Starting login again.");
+                    setStatus("Session expired. Redirecting to Genesys Cloud login...", "warning");
+                    await startPKCELogin();
+                    return;
+                }
+
+                const activeConversationIds = await getActiveConversationIds(token);
+
+                const pollSummary = `active=${activeConversationIds.length}`;
+                if (pollSummary !== lastPollSummary) {
+                    addDebug("POLL", pollSummary);
+                    lastPollSummary = pollSummary;
+                }
+
+                if (!activeConversationIds.length) {
+                    setStatus("Listening...\nNo active conversations found for this agent.", "info");
+                    return;
+                }
+
+                let pendingRequest = null;
+
+                for (const conversationId of activeConversationIds) {
+                    const conversation = await apiGet(
+                        `${API_BASE}/api/v2/conversations/${encodeURIComponent(conversationId)}`,
+                        token
+                    );
+
+                    const requestInfo = findSendMessageRequest(conversation);
+
+                    if (requestInfo) {
+                        pendingRequest = requestInfo;
+
+                        addDebug(
+                            "REQUEST_FOUND",
+                            `[conv:${shortId(requestInfo.conversationId)}] ` +
+                            `msg=${requestInfo.messageText} | ` +
+                            `comm=${shortId(requestInfo.communicationId)} | ` +
+                            `participant=${shortId(requestInfo.participantId)}`
+                        );
+
+                        break;
+                    }
+                }
+
+                if (!pendingRequest) {
+                    setStatus(
+                        "Listening...\nNo SEND / REQUESTED request found.\nActive conversations checked: " +
+                        activeConversationIds.length,
+                        "info"
+                    );
+                    return;
+                }
+
+                await processPendingRequest(token, pendingRequest);
+
+            } catch (err) {
+                addDebug("POLL_ERROR", getErrorText(err));
+                setStatus("Listener error: " + getErrorText(err), "error", true);
+            }
+        }
+
+        /************************************************************
+         * GET ACTIVE CONVERSATION IDS
+         ************************************************************/
+        async function getActiveConversationIds(token) {
+            const response = await apiGet(`${API_BASE}/api/v2/conversations`, token);
+
+            let conversations = [];
+
+            if (Array.isArray(response)) {
+                conversations = response;
+            } else if (Array.isArray(response.entities)) {
+                conversations = response.entities;
+            } else if (Array.isArray(response.conversations)) {
+                conversations = response.conversations;
+            }
+
+            const ids = conversations
+                .map(c => c.id || c.conversationId)
+                .filter(id => id);
+
+            return [...new Set(ids)];
+        }
+
+        /************************************************************
+         * FIND SEND MESSAGE REQUEST - REDUCED LOGGING
+         ************************************************************/
+        function findSendMessageRequest(conversation) {
+            const participants = conversation.participants || [];
+
+            for (const p of participants) {
+                const attrs = p.attributes || {};
+
+                const request = safeString(attrs[ATTR_REQUEST]);
+                const status = safeString(attrs[ATTR_STATUS]);
+                const text = safeString(attrs[ATTR_TEXT]);
+                const attrConversationId = safeString(attrs[ATTR_CONVERSATION_ID]);
+                const communicationId = safeString(attrs[ATTR_COMMUNICATION_ID]);
+
+                if (request === "SEND" || status === "REQUESTED" || status === "FAILED") {
+                    addDebug(
+                        "ATTR_MATCH",
+                        `[conv:${shortId(conversation.id)}] ` +
+                        `request=${request} | status=${status} | msg=${text} | ` +
+                        `attrConv=${shortId(attrConversationId)} | comm=${shortId(communicationId)} | ` +
+                        `participant=${shortId(p.id)} | purpose=${p.purpose || ""}`
+                    );
+                }
+
+                if (!attrConversationId || attrConversationId !== conversation.id) {
+                    continue;
+                }
+
+                if (request === "SEND" && status === "REQUESTED") {
+                    return {
+                        conversationId: attrConversationId,
+                        participantId: p.id,
+                        participantName: p.name || "",
+                        participantPurpose: p.purpose || "",
+                        communicationId: communicationId,
+                        messageText: text,
+                        attributes: attrs
+                    };
+                }
+            }
+
+            return null;
+        }
+
+        /************************************************************
+         * PROCESS REQUEST
+         ************************************************************/
+        async function processPendingRequest(token, requestInfo) {
+            const conversationId = requestInfo.conversationId;
+            const participantId = requestInfo.participantId;
+            const communicationId = requestInfo.communicationId;
+            const messageText = requestInfo.messageText;
+
+            if (!conversationId) {
+                addDebug("VALIDATION_FAILED", "Missing conversationId");
+                setStatus("FAILED: Missing AFT_SendMessage_ConversationId.", "error", true);
+                return;
+            }
+
+            if (!participantId) {
+                addDebug("VALIDATION_FAILED", `[conv:${shortId(conversationId)}] Missing participantId | msg=${messageText}`);
+                setStatus("FAILED: Missing participantId.", "error", true);
+                return;
+            }
+
+            if (!communicationId) {
+                addDebug("VALIDATION_FAILED", `[conv:${shortId(conversationId)}] Missing communicationId | msg=${messageText}`);
+
+                await updateParticipantAttributes(token, conversationId, participantId, {
+                    [ATTR_STATUS]: "FAILED",
+                    [ATTR_ERROR]: "Missing AFT_SendMessage_CommunicationId"
+                });
+
+                setStatus("FAILED: Missing AFT_SendMessage_CommunicationId.", "error", true);
+                return;
+            }
+
+            if (!messageText) {
+                addDebug("VALIDATION_FAILED", `[conv:${shortId(conversationId)}] Missing messageText | comm=${shortId(communicationId)}`);
+
+                await updateParticipantAttributes(token, conversationId, participantId, {
+                    [ATTR_STATUS]: "FAILED",
+                    [ATTR_ERROR]: "Missing AFT_SendMessage_Text"
+                });
+
+                setStatus("FAILED: Missing AFT_SendMessage_Text.", "error", true);
+                return;
+            }
+
+            isProcessing = true;
+
+            try {
+                addDebug(
+                    "SEND_START",
+                    `[conv:${shortId(conversationId)}] msg=${messageText} | comm=${shortId(communicationId)}`
+                );
+
+                setStatus(
+                    "Sending Hold/Resume message...\n" +
+                    "Message: " + messageText,
+                    "info",
+                    true
+                );
+
+                await sendMessageToConversation(token, conversationId, communicationId, messageText);
+
+                addDebug(
+                    "SEND_OK",
+                    `[conv:${shortId(conversationId)}] msg=${messageText}`
+                );
+
+                await updateParticipantAttributes(token, conversationId, participantId, {
+                    [ATTR_STATUS]: "SENT",
+                    [ATTR_RESULT]: "Message sent successfully",
+                    [ATTR_ERROR]: "",
+                    [ATTR_REQUEST]: "DONE"
+                });
+
+                addDebug(
+                    "ATTR_UPDATE_OK",
+                    `[conv:${shortId(conversationId)}] Request=DONE | Status=SENT | msg=${messageText}`
+                );
+
+                setStatus(
+                    "Message sent successfully.\n" +
+                    "Message: " + messageText,
+                    "success",
+                    true
+                );
+
+            } catch (err) {
+                addDebug(
+                    "SEND_FAILED",
+                    `[conv:${shortId(conversationId)}] msg=${messageText} | error=${getErrorText(err)}`
+                );
+
+                await updateParticipantAttributes(token, conversationId, participantId, {
+                    [ATTR_STATUS]: "FAILED",
+                    [ATTR_ERROR]: getErrorText(err),
+                    [ATTR_REQUEST]: "DONE"
+                });
+
+                setStatus("Send failed: " + getErrorText(err), "error", true);
+            } finally {
+                isProcessing = false;
+            }
+        }
+
+        /************************************************************
+         * SEND MESSAGE API
+         ************************************************************/
+        async function sendMessageToConversation(token, conversationId, communicationId, messageText) {
+            const endpoint =
+                `${API_BASE}/api/v2/conversations/messages/${encodeURIComponent(conversationId)}` +
+                `/communications/${encodeURIComponent(communicationId)}/messages`;
+
+            const response = await fetch(endpoint, {
+                method: "POST",
+                headers: {
+                    "Authorization": `Bearer ${token}`,
+                    "Content-Type": "application/json"
+                },
+                body: JSON.stringify({
+                    textBody: messageText
+                })
+            });
+
+            const responseText = await response.text();
+
+            if (!response.ok) {
+                if (response.status === 401) {
+                    sessionStorage.removeItem("gc_access_token");
+                    sessionStorage.removeItem("gc_token_expires_at");
+                }
+
+                throw new Error(
+                    "Send message failed." +
+                    "\nHTTP Status: " + response.status +
+                    "\nResponse: " + responseText
+                );
+            }
+
+            return responseText;
+        }
+
+        /************************************************************
+         * UPDATE PARTICIPANT ATTRIBUTES
+         ************************************************************/
+        async function updateParticipantAttributes(token, conversationId, participantId, attributes) {
+            const endpoint =
+                `${API_BASE}/api/v2/conversations/${encodeURIComponent(conversationId)}` +
+                `/participants/${encodeURIComponent(participantId)}/attributes`;
+
+            const response = await fetch(endpoint, {
+                method: "PATCH",
+                headers: {
+                    "Authorization": `Bearer ${token}`,
+                    "Content-Type": "application/json"
+                },
+                body: JSON.stringify({
+                    attributes: attributes
+                })
+            });
+
+            const responseText = await response.text();
+
+            if (!response.ok) {
+                if (response.status === 401) {
+                    sessionStorage.removeItem("gc_access_token");
+                    sessionStorage.removeItem("gc_token_expires_at");
+                }
+
+                throw new Error(
+                    "Failed to update participant attributes." +
+                    "\nHTTP Status: " + response.status +
+                    "\nResponse: " + responseText
+                );
+            }
+
+            return responseText;
+        }
+
+        /************************************************************
+         * GENERIC GET
+         ************************************************************/
+        async function apiGet(url, token) {
+            const response = await fetch(url, {
+                method: "GET",
+                headers: {
+                    "Authorization": `Bearer ${token}`,
+                    "Content-Type": "application/json"
+                }
+            });
+
+            const text = await response.text();
+
+            if (!response.ok) {
+                if (response.status === 401) {
+                    sessionStorage.removeItem("gc_access_token");
+                    sessionStorage.removeItem("gc_token_expires_at");
+                }
+
+                throw new Error(`GET failed. HTTP ${response.status}: ${text}`);
+            }
+
+            return text ? JSON.parse(text) : {};
+        }
+
+        /************************************************************
+         * PKCE LOGIN
+         ************************************************************/
+        async function startPKCELogin() {
+            const codeVerifier = generateCodeVerifier();
+            const codeChallenge = await generateCodeChallenge(codeVerifier);
+
+            sessionStorage.setItem("pkce_code_verifier", codeVerifier);
+            sessionStorage.setItem("rakbank_clientId", OAUTH_CLIENT_ID);
+            sessionStorage.setItem("rakbank_region", GENESYS_REGION);
+
+            const authUrl =
+                `${LOGIN_BASE}/oauth/authorize` +
+                `?response_type=code` +
+                `&client_id=${encodeURIComponent(OAUTH_CLIENT_ID)}` +
+                `&redirect_uri=${encodeURIComponent(REDIRECT_URI)}` +
+                `&code_challenge=${encodeURIComponent(codeChallenge)}` +
+                `&code_challenge_method=S256`;
+
+            window.location.href = authUrl;
+        }
+
+        async function handleOAuthCallback(code) {
+            const codeVerifier = sessionStorage.getItem("pkce_code_verifier");
+
+            if (!codeVerifier) {
+                throw new Error("Missing PKCE code verifier. Click Clear Session and try again.");
+            }
+
+            const body = new URLSearchParams();
+            body.append("grant_type", "authorization_code");
+            body.append("client_id", OAUTH_CLIENT_ID);
+            body.append("code", code);
+            body.append("redirect_uri", REDIRECT_URI);
+            body.append("code_verifier", codeVerifier);
+
+            const response = await fetch(`${LOGIN_BASE}/oauth/token`, {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/x-www-form-urlencoded"
+                },
+                body
+            });
+
+            const resultText = await response.text();
+            let result = {};
+
+            try {
+                result = resultText ? JSON.parse(resultText) : {};
+            } catch (_) {
+                result = { raw: resultText };
+            }
+
+            if (!response.ok) {
+                throw new Error("Token request failed: " + JSON.stringify(result));
+            }
+
+            const expiresAt = Date.now() + ((result.expires_in || 3600) * 1000);
+
+            sessionStorage.setItem("gc_access_token", result.access_token);
+            sessionStorage.setItem("gc_token_expires_at", String(expiresAt));
+            sessionStorage.setItem("rakbank_clientId", OAUTH_CLIENT_ID);
+            sessionStorage.setItem("rakbank_region", GENESYS_REGION);
+        }
+
+        function getAccessToken() {
+            try {
+                const token = sessionStorage.getItem("gc_access_token");
+                const expiresAtText = sessionStorage.getItem("gc_token_expires_at");
+                const expiresAt = Number(expiresAtText || 0);
+
+                if (!token) {
+                    return "";
+                }
+
+                if (!expiresAt || Date.now() > expiresAt - 60000) {
+                    sessionStorage.removeItem("gc_access_token");
+                    sessionStorage.removeItem("gc_token_expires_at");
+                    return "";
+                }
+
+                return token;
+            } catch (err) {
+                sessionStorage.removeItem("gc_access_token");
+                sessionStorage.removeItem("gc_token_expires_at");
+                return "";
+            }
+        }
+
+        /************************************************************
+         * PKCE HELPERS
+         ************************************************************/
+        function generateCodeVerifier() {
+            const array = new Uint8Array(64);
+            window.crypto.getRandomValues(array);
+            return base64UrlEncode(array);
+        }
+
+        async function generateCodeChallenge(codeVerifier) {
+            const data = new TextEncoder().encode(codeVerifier);
+            const digest = await window.crypto.subtle.digest("SHA-256", data);
+            return base64UrlEncode(new Uint8Array(digest));
+        }
+
+        function base64UrlEncode(arrayBuffer) {
+            let str = "";
+            const bytes = new Uint8Array(arrayBuffer);
+
+            for (let i = 0; i < bytes.byteLength; i++) {
+                str += String.fromCharCode(bytes[i]);
+            }
+
+            return btoa(str)
+                .replace(/\+/g, "-")
+                .replace(/\//g, "_")
+                .replace(/=/g, "");
+        }
+
+        /************************************************************
+         * UI / DEBUG HELPERS
+         ************************************************************/
+        function setStatus(message, type, forceUpdate = false) {
+            lastSummary = message;
+
+            if (debugMode && !forceUpdate) {
+                return;
+            }
+
+            const el = document.getElementById("status");
+            el.className = "status " + (type || "info");
+            el.textContent = message;
+        }
+
+        function addDebug(step, message) {
+            if (!debugCaptureEnabled) {
+                return;
+            }
+
+            const timestamp = new Date().toLocaleString();
+            const line = `[${timestamp}] ${step} ==> ${message}`;
+
+            debugLogs.push(line);
+
+            if (debugLogs.length > 200) {
+                debugLogs.shift();
+            }
+
+            console.log(line);
+
+            if (debugMode) {
+                renderDebugLogs();
+            }
+        }
+
+        function toggleDebugLogs() {
+            const btn = document.getElementById("debugBtn");
+            const downloadBtn = document.getElementById("downloadBtn");
+
+            if (!debugCaptureEnabled) {
+                debugMode = true;
+                debugCaptureEnabled = true;
+                debugLogs = [];
+                lastPollSummary = "";
+
+                btn.className = "debug debug-active main";
+                btn.textContent = "Stop Debug";
+                downloadBtn.style.display = "none";
+
+                const timestamp = new Date().toLocaleString();
+                debugLogs.push(`[${timestamp}] DEBUG_START ==> Debug logging started by user::REDIRECT_URI=${REDIRECT_URI}`);
+
+                renderDebugLogs();
+            } else {
+                const timestamp = new Date().toLocaleString();
+                debugLogs.push(`[${timestamp}] DEBUG_STOP ==> Debug logging stopped by user`);
+
+                debugCaptureEnabled = false;
+                debugMode = true;
+
+                btn.className = "debug main";
+                btn.textContent = "Start Debug";
+                downloadBtn.style.display = "block";
+
+                renderDebugLogs();
+            }
+        }
+
+        function renderDebugLogs() {
+            const el = document.getElementById("status");
+            el.className = "status info";
+
+            if (!debugLogs.length) {
+                el.textContent = "No debug logs available yet.";
+                return;
+            }
+
+            el.textContent = debugLogs.join("\n");
+            el.scrollTop = el.scrollHeight;
+        }
+
+        function downloadDebugLogs() {
+            const logs = debugLogs.join("\n");
+
+            if (!logs) {
+                setStatus("No debug logs available to download. Click Start Debug first.", "warning", true);
+                return;
+            }
+
+            const blob = new Blob([logs], { type: "text/plain" });
+            const url = URL.createObjectURL(blob);
+
+            const fileName = "RAKBANK_HoldResume_DebugLogs_" + new Date()
+                .toISOString()
+                .replace(/[:.]/g, "-") + ".txt";
+
+            const a = document.createElement("a");
+            a.href = url;
+            a.download = fileName;
+            a.style.display = "none";
+
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+
+            setTimeout(() => {
+                URL.revokeObjectURL(url);
+            }, 30000);
+
+            renderDebugLogs();
+        }
+
+        function clearSession() {
+            sessionStorage.clear();
+
+            debugLogs = [];
+            debugMode = false;
+            debugCaptureEnabled = false;
+            lastPollSummary = "";
+
+            const btn = document.getElementById("debugBtn");
+            const downloadBtn = document.getElementById("downloadBtn");
+
+            btn.className = "debug main";
+            btn.textContent = "Start Debug";
+            downloadBtn.style.display = "none";
+
+            setStatus("Session cleared. Refresh or reopen the Client App.", "success", true);
+        }
+
+        function getErrorText(err) {
+            if (!err) return "Unknown error";
+            if (typeof err === "string") return err;
+            if (err.message) return err.message;
+            return JSON.stringify(err);
+        }
+
+        function safeString(value) {
+            if (value === null || value === undefined) return "";
+            return String(value).trim();
+        }
+
+        function shortId(id) {
+            if (!id) return "";
+            return String(id).substring(0, 8);
+        }
+
+        function cleanUrl() {
+            const clean = window.location.origin + window.location.pathname;
+            window.history.replaceState({}, document.title, clean);
+        }
+    </script>
+</body>
+</html>
